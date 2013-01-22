@@ -3,12 +3,12 @@
 use strict;
 use warnings;
 use IO::Socket::INET;
-use Time::HiRes;
 use Digest::MD5 qw(md5);
 
 # phone definition
-my $phoneip = "192.168.1.1";
-my $wifipin = "1234";
+my $phoneip = "1.2.3.4";
+my $wifipin = "123456";
+
 
 # all possible commands
 use constant {
@@ -99,7 +99,7 @@ sub send_recv_packet(@){
 	my($socket, $cmd, $status, $flags, $string) = @_;
 	my $ret_cmd = 0; my $ret_status = 0; my $ret_flags = 0; my $ret_length = 0; my $ret_magic = 0;
 	my $tmpdata = ''; my $ret_data ='';
-	my $data=pack("n",PKT_MAGIC).pack("n",$cmd).$status.$flags.pack("N",length($string)).$string;
+	my $data=pack("n",PKT_MAGIC).pack("n",$cmd).pack('c',$status).pack('c',$flags).pack("N",length($string)).$string;
 	# print "Sending data:\n";hdump($data);
 	$socket->send($data);
 	my $finish=0;
@@ -109,6 +109,7 @@ sub send_recv_packet(@){
 	# when device is busy response is devided to many packets, we need to read them all
 	while($finish==0) {
 		$socket->recv($tmpdata, 1024);
+		$finish = 1 if length($tmpdata) == 0;
 		$data.=$tmpdata;
 		$readlen+=length($tmpdata);
 		if($readlen >= 10) { # read header
@@ -140,7 +141,7 @@ my ($socket,$client_socket);
 # socket, binds and connects to the TCP server running on the specific port.
 $socket = new IO::Socket::INET (
 	PeerHost => $phoneip,
-	PeerPort => '7750',
+	PeerPort => '7749',
 	Proto => 'tcp',
 	) or die "ERROR in Socket Creation : $!\n";
 
@@ -183,7 +184,17 @@ if ($ret_magic!=PKT_MAGIC || $ret_status != 0) {
 	print "Error: Contacts failed\n";
 	exit 1;
 }
-decode_contact_groups($ret_data);
+decode_contact_accounts($ret_data);
+
+# getting first contact
+($ret_magic,$ret_cmd,$ret_status,$ret_flags,$ret_length, $ret_data) = 
+	send_recv_packet($socket, CMD_PBK_GETFIRST, 0, 0, '');
+decode_contact($ret_data) if (!$ret_status);
+until($ret_status){
+	($ret_magic,$ret_cmd,$ret_status,$ret_flags,$ret_length, $ret_data) = 
+		send_recv_packet($socket, CMD_PBK_GETNEXT, 0, 0, '');
+	decode_contact($ret_data) if (!$ret_status);
+}
 
 ($ret_magic,$ret_cmd,$ret_status,$ret_flags,$ret_length, $ret_data) = 
 	send_recv_packet($socket, CMD_PBK_ENDSESSION, 0, 0, '');
@@ -191,11 +202,10 @@ if ($ret_magic!=PKT_MAGIC || $ret_status != 0) {
 	print "Error: Contacts failed\n";
 	exit 1;
 }
-
 $socket->close();
 
 
-sub decode_contact_groups {
+sub decode_contact_accounts {
 	my($data) = @_;
 	my $offset=0;
 	# hdump($data);
@@ -242,6 +252,72 @@ sub decode_id {
 	}
 	printf("  %-30s %s\n", $tags[$code],$text);
 	return $offset+$length+4;
+}
+
+sub decode_contact {
+	my($data) = @_;
+	# read record id
+	my $id=unpack('N',$data);
+	print "contact: id=$id\n";
+	my $offset = 4;
+	while ($offset > 0) {
+		$offset=decode_contact_item($data,$offset);
+	}
+	# saving contacts
+	open(CONTACT, "> contacts/${id}.bin")
+	    or die "Couldn't open contacts/${id} for writing: $!\n";
+	print CONTACT $data;
+	close(CONTACT);
+	# hdump($data);
+}
+
+sub decode_contact_item {
+	# there are 2 different models - for strings and for array of bytes.
+	# array of bytes:
+	# 3332 - mOwnerAccount.mId;
+	# 3333 - this.mId (group related??)
+	# 65104 - photo
+	#
+	# strings
+	# 1802   AggregateName
+	# 3334   LookupKey
+	# 65120  Ringtone
+	# 65089  FLAG_SEND_TO_VOICEMAIL 
+	# 1808   FLAG_FAVORITE_STARTED 
+	# vnd.android.cursor.item/email_v2 { 2055, 2048, 2052, 2053, 2054 };
+	# vnd.android.cursor.item/contact_event" { 1828, 1826, 1827, 1824 }
+	# vnd.android.cursor.item/im" { 3087, 3072, 3073, 3074, 3075, 3076, 3077, 3078, 3079, 3080 } 
+	# vnd.android.cursor.item/name" { 1792 }, { 1793 }, { 1794 }, { 1798 }, { 1799 }, { 1800 }, { 8193 }, { 8213 }, { 8194 }
+	# vnd.android.cursor.item/nickname { 1795, 1795, 1795, 1795, 1795, 1795 }
+	# vnd.android.cursor.item/note { 2560 }
+	# vnd.android.cursor.item/organization { 65046, 65040, 65043 }, { 65047, 65041, 65044 }, { 65048, 65042, 65045 }
+	# vnd.android.cursor.item/phone_v2 { 2841, 2818, 2819, 2822, 2820, 2830, 2827, 2826, 2842, 2843, 2844, 2845, 2846, 2831, 2847, 2848, 2849, 2829, 2837, 2850, 2851 }
+	# vnd.android.cursor.item/website { 65063, 65056, 65060, 65061, 65057, 65058, 65062, 65059 }
+	# 
+	my($data,$offset) = @_;
+	my $length = 0;
+	my($paramL,$code) = unpack("x[$offset]Nn", $data);
+	$offset+=6;
+	my @bytearrays = (3332, 3333, 65104); # all packets with "bytearray" structure
+	print "  code=$code ";
+	if (grep {$_ == $code} @bytearrays) {
+		($length) = unpack("x[$offset]N", $data);
+		$offset+=4;
+		# XXX read content
+		$offset+=$length;
+		print "byte array, length=$length\n";
+	}
+	else {
+		my $paramI2;
+		($paramI2, $length) = unpack("x[$offset]nn", $data);
+		$offset+=4;
+		## XXX read content
+		$offset+=$length;
+		print "string array, length: $length\n";
+	}
+	$offset = -1 if $offset>=length($data);
+	return $offset;
+	# hdump($data);
 }
 
 # for debugging
